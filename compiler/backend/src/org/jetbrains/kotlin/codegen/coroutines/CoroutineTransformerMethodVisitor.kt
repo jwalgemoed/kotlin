@@ -93,7 +93,6 @@ class CoroutineTransformerMethodVisitor(
         // First instruction in the method node may change in case of named function
         val actualCoroutineStart = methodNode.instructions.first
 
-        var startLabelNode: LabelNode? = null
         if (isForNamedFunction) {
             ReturnUnitMethodTransformer.transform(containingClassInternalName, methodNode)
 
@@ -108,7 +107,7 @@ class CoroutineTransformerMethodVisitor(
             }
             continuationIndex = methodNode.maxLocals++
 
-            startLabelNode = prepareMethodNodePreludeForNamedFunction(methodNode)
+            prepareMethodNodePreludeForNamedFunction(methodNode)
         } else {
             ReturnUnitMethodTransformer.cleanUpReturnsUnitMarkers(methodNode, ReturnUnitMethodTransformer.findReturnsUnitMarks(methodNode))
         }
@@ -137,12 +136,16 @@ class CoroutineTransformerMethodVisitor(
         val defaultLabel = LabelNode()
         val tableSwitchLabel = LabelNode()
         methodNode.instructions.apply {
+            // The very first instruction of suspend lambda's 'invokeSuspend' method shall be label, otherwise, d8 emits warning about
+            // invalid debug info
             val startLabel = LabelNode()
+            val firstStateLabel = LabelNode()
 
             // tableswitch(this.label)
             insertBefore(
                 actualCoroutineStart,
                 insnListOf(
+                    startLabel,
                     *withInstructionAdapter { loadCoroutineSuspendedMarker(languageVersionSettings) }.toArray(),
                     tableSwitchLabel,
                     // Allow debugger to stop on enter into suspend function
@@ -154,13 +157,13 @@ class CoroutineTransformerMethodVisitor(
                         0,
                         suspensionPoints.size,
                         defaultLabel,
-                        startLabel, *suspensionPointLabels.toTypedArray()
+                        firstStateLabel, *suspensionPointLabels.toTypedArray()
                     ),
-                    startLabel
+                    firstStateLabel
                 )
             )
 
-            insert(startLabel, withInstructionAdapter {
+            insert(firstStateLabel, withInstructionAdapter {
                 generateResumeWithExceptionCheck(languageVersionSettings.isReleaseCoroutines(), dataIndex, exceptionIndex)
             })
             insert(last, defaultLabel)
@@ -174,12 +177,19 @@ class CoroutineTransformerMethodVisitor(
         dropSuspensionMarkers(methodNode, suspensionPoints)
         methodNode.removeEmptyCatchBlocks()
 
+        // The very last instruction shall be label, since parameters must be alive throughout the method's body. Otherwise, d8 emits
+        // warning about invalid debug info
+        val endLabel = LabelNode()
+        methodNode.instructions.insert(methodNode.instructions.last, endLabel)
+
+        val startLabel = methodNode.instructions.first as? LabelNode
+            ?: error("The very first instruction of method shall be LabelNode, but got ${methodNode.instructions.first}")
+        fixLvtForParameters(methodNode, startLabel, endLabel)
+
         if (isForNamedFunction) {
-            addContinuationToLvt(
-                methodNode,
-                startLabelNode.sure { "start label has not been initialized during prelude generation" },
-                defaultLabel
-            )
+            // ACHTUNG! This is _continuation_, not _completion_, it can be allocated inside the method, thus, it is incorrect to treat it
+            // as a parameter
+            addContinuationToLvt(methodNode, tableSwitchLabel, defaultLabel)
         }
 
         if (languageVersionSettings.isReleaseCoroutines() && !isCrossinlineLambda) {
@@ -189,6 +199,24 @@ class CoroutineTransformerMethodVisitor(
             }
             writeDebugMetadata(methodNode, suspensionPointLabelNodes, spilledToVariableMapping)
         }
+    }
+
+    private fun fixLvtForParameters(methodNode: MethodNode, startLabel: LabelNode, endLabel: LabelNode) {
+        val paramsNum =
+                /* this */ (if (internalNameForDispatchReceiver != null) 1 else 0) +
+                /* real params */ Type.getArgumentTypes(methodNode.desc).size
+
+        for (i in 0..paramsNum) {
+            fixRangeOfLvtRecord(methodNode, i, startLabel, endLabel)
+        }
+    }
+
+    private fun fixRangeOfLvtRecord(methodNode: MethodNode, index: Int, startLabel: LabelNode, endLabel: LabelNode) {
+        val vars = methodNode.localVariables.filter { it.index == index }
+        assert(vars.size <= 1) {
+            "Someone else occupies parameter's slot at $index"
+        }
+        vars.firstOrNull()?.let { it.start = startLabel; it.end = endLabel }
     }
 
     private fun writeDebugMetadata(
@@ -291,7 +319,7 @@ class CoroutineTransformerMethodVisitor(
         )
     }
 
-    private fun prepareMethodNodePreludeForNamedFunction(methodNode: MethodNode): LabelNode {
+    private fun prepareMethodNodePreludeForNamedFunction(methodNode: MethodNode) {
         val objectTypeForState = Type.getObjectType(classBuilderForCoroutineState.thisName)
         val continuationArgumentIndex = getLastParameterIndex(methodNode.desc, methodNode.access)
         methodNode.instructions.asSequence().filterIsInstance<VarInsnNode>().forEach {
@@ -300,9 +328,8 @@ class CoroutineTransformerMethodVisitor(
             it.`var` = continuationIndex
         }
 
-        val startLabel = LabelNode()
-
         methodNode.instructions.insert(withInstructionAdapter {
+            val startLabel = LabelNode()
             val createStateInstance = Label()
             val afterCoroutineStateCreated = Label()
 
@@ -373,7 +400,6 @@ class CoroutineTransformerMethodVisitor(
                 visitVarInsn(Opcodes.ASTORE, exceptionIndex)
             }
         })
-        return startLabel
     }
 
     private fun removeUnreachableSuspensionPointsAndExitPoints(methodNode: MethodNode, suspensionPoints: MutableList<SuspensionPoint>) {
