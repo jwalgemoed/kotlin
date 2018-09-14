@@ -5,8 +5,8 @@ import kotlin.script.dependencies.*
 import kotlin.script.experimental.dependencies.*
 import kotlin.script.templates.ScriptTemplateDefinition
 
-class SuccessDependenciesResolver : AsyncDependenciesResolver {
-    override suspend fun resolveAsync(
+class SuccessDependenciesResolver : DependenciesResolver {
+    override fun resolve(
             scriptContents: ScriptContents,
             environment: Environment
     ): DependenciesResolver.ResolveResult {
